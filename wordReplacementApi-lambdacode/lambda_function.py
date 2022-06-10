@@ -27,8 +27,18 @@ def lambda_handler(event, context):
         logger.info("Lambda_Handler:: Entering the handler")
         
         #Reading the input string
-        input_str = event['queryStringParameters']['input']
-        print("The original string is : " + str(input_str))
+        try:
+            input_str = event['queryStringParameters']['input']
+        except (TypeError,KeyError):
+            return {
+              'statusCode': 400,
+              'body': 'Error Message: Please use input as a queryStringParameter'
+            }
+        
+        if not input_str:
+            return {
+              'statusCode': 204
+            }
         
         #Reading the config file for list of companies
         configPath = os.environ['LAMBDA_TASK_ROOT'] + "/companies.txt"    #path of the file containing name of companies
@@ -61,18 +71,17 @@ def replace_string(listCompanies,input_str):
     """ this method is for replacing the string"""
     
     logger.info("replace_string:: Entering the Function")
-    
     try: 
-        for i in listCompanies:
-            repl = i + u"\u00A9"
-            subs = i                    # initializing substring to be replaced
-            
-            # re.IGNORECASE ignoring cases
-            # compilation step to escape the word for all cases
-            compiled = re.compile(re.escape(subs), re.IGNORECASE)
-            input_str = compiled.sub(repl, input_str)
-        
-        print("Replaced String : " + str(input_str))
+        wordsString= input_str.split(' ')
+        x=0
+        for i in wordsString:
+            for j in listCompanies:
+                #print("{}={}".format(i,j))
+                if i.lower() == j.lower():
+                    j= j + u"\u00A9"
+                    wordsString[x] = j
+            x +=1
+        input_str= ' '.join(map(str, wordsString))
         return (input_str)
     
     except:
@@ -87,8 +96,8 @@ def send_sns_exception(errorDescDict, context):
     try:
         logger.info("send_sns_exception :: Entering the Function")
         sns_error_message = '\n'
-        sns_error_message = sns_error_message + context.function_name + ' lambda functios has failed, below are the failure details. Please take necessary action.'
-        sns_error_message = sns_error_message + '\\nError Message'+'                    :  ' + errorDescDict['errorMessage']
+        sns_error_message = sns_error_message + context.function_name + ' lambda function has failed, below are the failure details. Please take necessary action.'
+        sns_error_message = sns_error_message + '\n\nError Message'+'                    :  ' + errorDescDict['errorMessage']
         sns_error_message = sns_error_message + '\nLambda Function Name'+'    :  ' + context.function_name
         sns_error_message = sns_error_message + '\nRequestId'+'                           :  ' + context.aws_request_id
         sns_error_message = sns_error_message + '\nLog Stream Name'+'              :  ' + context.log_stream_name
