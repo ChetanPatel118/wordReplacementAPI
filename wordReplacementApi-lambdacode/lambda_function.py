@@ -1,118 +1,124 @@
 import boto3
 import logging
-import  sys
-import datetime
+import os
+import re
 import json
-import os,re
 
-#Initializing Logger
-logger=logging.getLogger()
+# Initialize Logger
+logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Initialize SNS
+sns = boto3.client('sns')
 
-#Defining environment variables
-sendSnsException = os.getenv("sendSNSException")
-topicArn = os.getenv("snsTopicArn")
+# Configuration
+SEND_SNS_EXCEPTION = os.getenv("sendSNSException", "False").lower() == "true"
+TOPIC_ARN = os.getenv("snsTopicArn")
 
-#Initializing SNS
-sns=boto3.client('sns')
+# Global state for cached companies
+COMPANY_MAP = {}
+REGEX_PATTERN = None
+
+def load_companies():
+    """Loads companies from file and compiles regex pattern."""
+    global COMPANY_MAP, REGEX_PATTERN
+    
+    if COMPANY_MAP:
+        return
+
+    try:
+        companies_file = os.path.join(os.environ.get('LAMBDA_TASK_ROOT', ''), 'companies.txt')
+        logger.info(f"Loading companies from {companies_file}")
+        
+        with open(companies_file, 'r') as f:
+            content = f.read()
+            # Logic to match original parsing: take first part before space, then split by newline
+            # This handles the case where there might be extra data after a space in the file
+            raw_list = content.split(" ")[0].split("\n")
+            
+            for company in raw_list:
+                company = company.strip()
+                if company:
+                    # Map lowercase to display version with copyright
+                    COMPANY_MAP[company.lower()] = company + "\u00A9"
+        
+        if COMPANY_MAP:
+            # Sort by length descending to match longest possible words first (good practice for regex)
+            sorted_keys = sorted(COMPANY_MAP.keys(), key=len, reverse=True)
+            pattern_str = r'\b(' + '|'.join(map(re.escape, sorted_keys)) + r')\b'
+            REGEX_PATTERN = re.compile(pattern_str, re.IGNORECASE)
+            
+    except Exception as e:
+        logger.error(f"Failed to load companies file: {e}")
+        # We continue, as the lambda might still function without replacements or fail gracefully later
+
+# Load on cold start
+load_companies()
 
 def lambda_handler(event, context):
-    """ main lambda handler function for getting the message from the event object"""
-    
-    errorDescDict = {'errorMessage':''}
+    """Main lambda handler function."""
+    logger.info("Lambda_Handler:: Entering the handler")
     
     try:
-        startTime = datetime.datetime.now()
-        logger.info("Lambda_Handler:: Entering the handler")
-        
-        #Reading the input string
-        try:
-            input_str = event['queryStringParameters']['input']
-        except (TypeError,KeyError):
-            return {
+        # Input validation
+        query_params = event.get('queryStringParameters')
+        if not query_params or 'input' not in query_params:
+             return {
               'statusCode': 400,
               'body': 'Error Message: Please use input as a queryStringParameter'
             }
         
+        input_str = query_params['input']
+        
         if not input_str:
-            return {
+             return {
               'statusCode': 204
             }
-        
-        #Reading the config file for list of companies
-        configPath = os.environ['LAMBDA_TASK_ROOT'] + "/companies.txt"    #path of the file containing name of companies
-        companies = open(configPath).read()
-        listCompanies = companies.split(" ")[0].split("\n")
-    
-        input_str=replace_string (listCompanies,input_str)
-        
-        endTime = datetime.datetime.now()
-        delta = endTime - startTime
-        logger.info("Lambda_Handler:: Total Time taken for execution {} ms ".format(delta.total_seconds()*1000))
-        
+
+        # Replacement logic
+        output_str = input_str
+        if REGEX_PATTERN:
+            def replace_callback(match):
+                word = match.group(0)
+                return COMPANY_MAP.get(word.lower(), word)
+            
+            output_str = REGEX_PATTERN.sub(replace_callback, input_str)
+
         return {
-        'statusCode': 200,
-        'body': (input_str)
+            'statusCode': 200,
+            'body': output_str
         }
-    
-    except:
-        logger.error(':: lambda handler :: following exception occured:' + str(sys.exc_info()))
-        logger.info(':: lambda handler::  Exiting handler')
-        errorDescDict['errorMessage'] = str(sys.exc_info())
-        logger.info(':: lambda handler::  before invoking send_sns_exception')
-        send_sns_exception(errorDescDict, context)
-        logger.info(':: lambda handler::  After invoking send_sns_exception')
-        
-        return str(sys.exc_info())
-        
-        
-def replace_string(listCompanies,input_str):
-    """ this method is for replacing the string"""
-    
-    logger.info("replace_string:: Entering the Function")
-    try: 
-        wordsString= input_str.split(' ')
-        x=0
-        for i in wordsString:
-            for j in listCompanies:
-                #print("{}={}".format(i,j))
-                if i.lower() == j.lower():
-                    j= j + u"\u00A9"
-                    wordsString[x] = j
-            x +=1
-        input_str= ' '.join(map(str, wordsString))
-        return (input_str)
-    
-    except:
-        logger.error(':: replace_string :: following exception occured:' + str(sys.exc_info()))
-        logger.info(':: replace_string :: Exiting function')
-        raise Exception(str(sys.exc_info()))
 
+    except Exception as e:
+        logger.exception("Lambda execution failed")
+        send_sns_exception(str(e), context)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
 
-def send_sns_exception(errorDescDict, context):
-    """ this method is for sending email notificaiton to subscribers in case of lambda failures"""
-    
+def send_sns_exception(error_message, context):
+    """Sends SNS notification on failure."""
     try:
-        logger.info("send_sns_exception :: Entering the Function")
-        sns_error_message = '\n'
-        sns_error_message = sns_error_message + context.function_name + ' lambda function has failed, below are the failure details. Please take necessary action.'
-        sns_error_message = sns_error_message + '\n\nError Message'+'                    :  ' + errorDescDict['errorMessage']
-        sns_error_message = sns_error_message + '\nLambda Function Name'+'    :  ' + context.function_name
-        sns_error_message = sns_error_message + '\nRequestId'+'                           :  ' + context.aws_request_id
-        sns_error_message = sns_error_message + '\nLog Stream Name'+'              :  ' + context.log_stream_name
-        sns_error_message = sns_error_message + '\nLog Group Name'+'               :  ' + context.log_group_name
-        logger.info("send_sns_exception :: Sending error message to SNS Topic: " + str(sns_error_message))
-        
-        if sendSnsException == "True":
-            logger.info("send_sns_exception :: Sending error message to SNS Topic:" + topicArn)
-            message_send = sns.publish(TopicArn=topicArn, Message=sns_error_message,Subject = context.function_name + ' :: Lambda failure notification')
-            logger.info("send_sns_exception  :: response from sns:" + str(message_send))
-    
-    except:
-        logger.error(':: send_sns_exception :: following exception occured:' + str(sys.exc_info()))
-        logger.info(':: send_sns_exception:: Exiting function')
-        raise Exception(str(sys.exc_info()))  
+        if not SEND_SNS_EXCEPTION or not TOPIC_ARN:
+            logger.info("SNS notification disabled or Topic ARN missing")
+            return
 
-    
-    
+        message = (
+            f"{context.function_name} lambda function has failed, below are the failure details. Please take necessary action.\n\n"
+            f"Error Message                    :  {error_message}\n"
+            f"Lambda Function Name    :  {context.function_name}\n"
+            f"RequestId                           :  {context.aws_request_id}\n"
+            f"Log Stream Name              :  {context.log_stream_name}\n"
+            f"Log Group Name               :  {context.log_group_name}"
+        )
+        
+        logger.info(f"Sending error message to SNS Topic: {TOPIC_ARN}")
+        sns.publish(
+            TopicArn=TOPIC_ARN,
+            Message=message,
+            Subject=f"{context.function_name} :: Lambda failure notification"
+        )
+        
+    except Exception:
+        logger.exception("Failed to send SNS notification")
